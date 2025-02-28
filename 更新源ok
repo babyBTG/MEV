@@ -1,0 +1,185 @@
+import fs from 'fs';
+import dotenv from 'dotenv';
+import axios from 'axios';
+import Web3 from 'web3';
+
+// 加载环境变量（使用相对路径）
+dotenv.config({ path: './config.env' });
+
+// 设置账号和私钥
+const account = '0x43be9AFA6B131A89B0771Aa9365A8967aDa3b06f';  
+const privateKey = process.env.PRIVATE_KEY;
+const web3 = new Web3(new Web3.providers.HttpProvider('https://bsc-dataseed.binance.org/'));
+
+// 加载 ABI 文件（改为相对路径）
+const pancakeAbi = JSON.parse(fs.readFileSync('./PancakeSwapABI.json', 'utf-8'));
+const erc20Abi = JSON.parse(fs.readFileSync('./ERC20ABI.json', 'utf-8'));
+
+// PancakeSwap 路由地址和 WBNB 地址
+const PANCAKE_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';  
+const WBNB = '0xBB4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c'.toLowerCase(); 
+const pancakeRouter = new web3.eth.Contract(pancakeAbi, PANCAKE_ROUTER);
+
+// 检查余额
+async function checkBalance() {
+    const balance = await web3.eth.getBalance(account);
+    console.log(`💰 当前钱包余额: ${web3.utils.fromWei(balance, 'ether')} BNB`);
+
+    const wbnbBalance = await getTokenBalance(WBNB);
+    console.log(`💰 当前钱包WBNB余额: ${web3.utils.fromWei(wbnbBalance, 'ether')} WBNB`);
+}
+
+// 获取某个代币余额
+async function getTokenBalance(tokenAddress) {
+    const token = new web3.eth.Contract(erc20Abi, tokenAddress);
+    const balance = await token.methods.balanceOf(account).call();
+    return balance;
+}
+
+// 获取当前 Gas 价格
+async function getGasPrice() {
+    try {
+        const response = await axios.get('https://api.bscscan.com/api', {
+            params: {
+                module: 'gastracker',
+                action: 'gasoracle',
+                apikey: process.env.BSCSCAN_API_KEY
+            }
+        });
+        const fastGasPrice = response.data.result.FastGasPrice;
+        if (!fastGasPrice) {
+            throw new Error('无法获取有效的 Gas 价格');
+        }
+        return web3.utils.toWei(fastGasPrice.toString(), 'gwei');
+    } catch (err) {
+        console.error('获取 Gas 价格失败:', err);
+        return web3.utils.toWei('5', 'gwei'); // 默认值
+    }
+}
+
+// 获取代币税率
+async function getTaxPercentage(tokenAddress) {
+    try {
+        const token = new web3.eth.Contract(erc20Abi, tokenAddress);
+        const code = await web3.eth.getCode(tokenAddress);
+        if (code === '0x' || tokenAddress === '0x0000000000000000000000000000000000000000') {
+            console.log(`⚠️ 无效的ERC-20合约地址: ${tokenAddress}`);
+            return 0; 
+        }
+
+        const taxPercentage = await token.methods.taxPercentage().call();
+        return parseInt(taxPercentage, 10);
+    } catch (err) {
+        console.error('获取税率失败:', err);
+        return 0; 
+    }
+}
+
+// 持续轮询区块
+async function pollBlocks() {
+    await checkBalance();
+    let latestBlock = await web3.eth.getBlockNumber();
+    console.log(`当前最新区块: ${latestBlock}`);
+
+    setInterval(async () => {
+        try {
+            let newBlock = await web3.eth.getBlockNumber();
+            if (newBlock > latestBlock) {
+                console.log(`检测到新区块: ${newBlock}`);
+                latestBlock = newBlock;
+                await processBlock(newBlock);
+            }
+        } catch (err) {
+            console.error("RPC 连接失败，尝试切换节点...", err);
+        }
+    }, 2000);
+}
+
+async function processBlock(blockNumber) {
+    try {
+        const block = await web3.eth.getBlock(blockNumber, true);
+        if (!block || !block.transactions) return;
+
+        for (const tx of block.transactions) {
+            if (tx.to && tx.to.toLowerCase() === PANCAKE_ROUTER.toLowerCase()) {
+                console.log(`发现 PancakeSwap 交易: ${tx.hash}`);
+                await analyzeTransaction(tx);
+            }
+        }
+    } catch (err) {
+        console.error("获取区块失败:", err);
+    }
+}
+
+// 解析交易，识别并进行三明治攻击
+async function analyzeTransaction(tx) {
+    try {
+        const tokenAddress = '0x' + tx.input.slice(34, 74); 
+        console.log(`检测到代币: ${tokenAddress}`);
+        
+        const code = await web3.eth.getCode(tokenAddress);
+        if (code === '0x' || tokenAddress === '0x0000000000000000000000000000000000000000') {
+            console.log(`⚠️ 无效的ERC-20合约地址: ${tokenAddress}`);
+            return;
+        }
+
+        const tax = await getTaxPercentage(tokenAddress);
+        if (tax > 5) {
+            console.log(`⚠️ 高税收代币 (${tax}%)，跳过夹单`);
+            return;
+        }
+
+        const wbnbBalance = await getTokenBalance(WBNB);
+        const canUseBNB = await canUseBNBForTransaction(tokenAddress);
+        const tokenAmount = getRandomAmountBasedOnBNBValue();
+
+        if (wbnbBalance > 0 || canUseBNB) {
+            await executeSandwichAttack(tokenAddress, tx, tokenAmount);
+        } else {
+            console.log("没有足够的WBNB或者合约不支持直接使用BNB进行交易，跳过此次交易。");
+        }
+    } catch (err) {
+        console.error("解析交易失败:", err);
+    }
+}
+
+async function canUseBNBForTransaction(tokenAddress) {
+    return true; 
+}
+
+function getRandomAmountBasedOnBNBValue() {
+    const minAmount = 0.001; 
+    const maxAmount = 0.035; 
+    return (Math.random() * (maxAmount - minAmount) + minAmount).toFixed(5); 
+}
+
+async function executeSandwichAttack(tokenAddress, tx, tokenAmount) {
+    console.log(`✅ 进行三明治攻击 ${tokenAddress}`);
+    
+    const gasPrice = await getGasPrice();
+    const adjustedGasPrice = web3.utils.toWei((parseFloat(gasPrice) * 1.5).toString(), 'gwei');
+
+    const buyTx = {
+        from: account,
+        to: PANCAKE_ROUTER,
+        gasLimit: 300000,
+        gasPrice: adjustedGasPrice,
+        value: web3.utils.toWei(tokenAmount, 'ether'),
+        data: pancakeRouter.methods.swapExactETHForTokensSupportingFeeOnTransferTokens(
+            0,
+            [WBNB, tokenAddress],
+            account,
+            Math.floor(Date.now() / 1000) + 300 
+        ).encodeABI()
+    };
+
+    try {
+        const signedTx = await web3.eth.accounts.signTransaction(buyTx, privateKey);
+        const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+        console.log(`交易成功: ${receipt.transactionHash}`);
+    } catch (err) {
+        console.error("交易失败:", err);
+    }
+}
+
+pollBlocks();  
